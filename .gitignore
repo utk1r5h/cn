@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+.proofdrop/
+server_data/
+keys/
+*.sqlite3
+*.db
