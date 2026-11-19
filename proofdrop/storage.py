@@ -175,3 +175,13 @@ class UploadStore:
             }
             db.execute("UPDATE uploads SET status='complete', receipt_json=? WHERE upload_id=?", (json.dumps(receipt, sort_keys=True), upload_id))
             return receipt
+
+    def status_rows(self) -> list[dict]:
+        """Return a compact view of upload and acknowledged-chunk state."""
+        with self.lock, self.connect() as db:
+            rows = db.execute("""SELECT u.upload_id, u.filename, u.size, u.total_chunks,
+                    u.status, u.created_at, COUNT(c.chunk_index) AS stored_chunks,
+                    COALESCE(SUM(c.size), 0) AS stored_bytes
+                FROM uploads AS u LEFT JOIN chunks AS c ON c.upload_id=u.upload_id
+                GROUP BY u.upload_id ORDER BY u.created_at DESC""").fetchall()
+            return [dict(row) for row in rows]

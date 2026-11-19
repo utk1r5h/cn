@@ -41,7 +41,16 @@ def state_upload_id(state_path: str, remote: str, path: str, digest: str) -> str
         return upload_id
 
 
-def upload(path: str, host: str, port: int, chunk_size: int, public_key_path: str, state_path: str) -> dict:
+def upload(
+    path: str,
+    host: str,
+    port: int,
+    chunk_size: int,
+    public_key_path: str,
+    state_path: str,
+    window_size: int = 1,
+    demo_rtt_ms: int = 0,
+) -> dict:
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Not a regular file: {path}")
@@ -60,6 +69,12 @@ def upload(path: str, host: str, port: int, chunk_size: int, public_key_path: st
         "total_chunks": total_chunks,
         "sha256": digest,
     }
+    transfer_started = time.monotonic()
+    wire_bytes_sent = 0
+    acknowledged_bytes = 0
+    acknowledged_chunks = 0
+    ack_times = []
+    already_stored_chunks = 0
 
     # If a connection drops, reconnect and ask the server which chunks remain.
     for attempt in range(1, 4):
@@ -74,24 +89,46 @@ def upload(path: str, host: str, port: int, chunk_size: int, public_key_path: st
                 if ready.get("type") != "ready":
                     raise ValueError("Unexpected server response")
                 missing = ready.get("missing", [])
-                print(f"Upload {upload_id}: {size} bytes, {total_chunks} chunks; {len(missing)} to send")
+                already_stored_chunks = total_chunks - len(missing)
+                print(
+                    f"Upload {upload_id}: {size} bytes, {total_chunks} chunks; "
+                    f"{len(missing)} to send (application window {window_size})"
+                )
                 with open(path, "rb") as stream:
-                    for index in missing:
-                        stream.seek(index * chunk_size)
-                        data = stream.read(chunk_size)
-                        channel.send({
-                            "action": "chunk",
-                            "upload_id": upload_id,
-                            "index": index,
-                            "sha256": hashlib.sha256(data).hexdigest(),
-                            "data": base64.b64encode(data).decode("ascii"),
-                        })
-                        ack = channel.receive()
-                        if ack.get("type") == "error":
-                            raise ValueError(ack.get("message", "Server rejected a chunk"))
-                        if ack.get("type") != "chunk_ack" or ack.get("index") != index:
-                            raise ValueError("Server acknowledged an unexpected chunk")
-                        print(f"  stored chunk {index + 1}/{total_chunks}")
+                    for batch_start in range(0, len(missing), window_size):
+                        batch = missing[batch_start:batch_start + window_size]
+                        outstanding = {}
+                        for index in batch:
+                            stream.seek(index * chunk_size)
+                            data = stream.read(chunk_size)
+                            send_started = time.monotonic()
+                            channel.send({
+                                "action": "chunk",
+                                "upload_id": upload_id,
+                                "index": index,
+                                "sha256": hashlib.sha256(data).hexdigest(),
+                                "data": base64.b64encode(data).decode("ascii"),
+                            })
+                            wire_bytes_sent += len(data)
+                            outstanding[index] = (len(data), send_started)
+
+                        # This optional wait is a teaching aid: one delay per ACK
+                        # batch makes the effect of RTT and window size visible.
+                        if demo_rtt_ms:
+                            time.sleep(demo_rtt_ms / 1000)
+
+                        for _ in batch:
+                            ack = channel.receive()
+                            if ack.get("type") == "error":
+                                raise ValueError(ack.get("message", "Server rejected a chunk"))
+                            index = ack.get("index")
+                            if ack.get("type") != "chunk_ack" or index not in outstanding:
+                                raise ValueError("Server acknowledged an unexpected chunk")
+                            data_size, send_started = outstanding.pop(index)
+                            ack_times.append(time.monotonic() - send_started)
+                            acknowledged_bytes += data_size
+                            acknowledged_chunks += 1
+                            print(f"  ACK for chunk {index + 1}/{total_chunks}")
                 channel.send({"action": "finalize", "upload_id": upload_id})
                 response = channel.receive()
                 if response.get("type") == "error":
@@ -105,6 +142,23 @@ def upload(path: str, host: str, port: int, chunk_size: int, public_key_path: st
                 receipt_path = os.path.join(receipt_directory, f"{upload_id}.json")
                 with open(receipt_path, "w", encoding="utf-8") as receipt_file:
                     json.dump(response, receipt_file, indent=2, sort_keys=True)
+                elapsed = max(time.monotonic() - transfer_started, 0.000001)
+                throughput = wire_bytes_sent / elapsed
+                average_ack = sum(ack_times) / len(ack_times) if ack_times else None
+                print("\nTransfer summary")
+                print(f"  Chunks acknowledged this run: {acknowledged_chunks}")
+                print(f"  Chunks already stored:        {already_stored_chunks}")
+                print(f"  File bytes acknowledged:      {acknowledged_bytes}")
+                print(f"  File bytes sent this run:     {wire_bytes_sent}")
+                print(f"  Elapsed transfer time:        {elapsed:.3f} s")
+                print(f"  File-data throughput:         {throughput / (1024 * 1024):.3f} MiB/s")
+                print(f"  Application ACK window:      {window_size} chunk(s)")
+                if demo_rtt_ms:
+                    print(f"  Teaching RTT wait per batch: {demo_rtt_ms} ms")
+                if average_ack is not None:
+                    print(f"  Mean chunk ACK time:          {average_ack * 1000:.2f} ms (network + server processing + teaching wait)")
+                else:
+                    print("  Mean chunk ACK time:          n/a (all chunks were already stored)")
                 return {"receipt": response["receipt"], "signature": response["signature"]}
         except (ConnectionError, TimeoutError, socket.timeout, OSError):
             if attempt == 3:
@@ -120,17 +174,23 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5050)
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Bytes per chunk (max 2097152)")
+    parser.add_argument("--window-size", type=int, default=1, help="Maximum chunks sent before waiting for ACKs (1=stop-and-wait, max 64)")
+    parser.add_argument("--demo-rtt-ms", type=int, default=0, help="Optional teaching delay per ACK batch, in milliseconds")
     parser.add_argument("--server-key", default="keys/server_public.pem", help="Pinned server public key used for authentication and receipt verification")
     parser.add_argument("--state", default=".proofdrop/client_state.sqlite3", help="Local resume-state database")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Securely submit and resume a file with ProofDrop")
+    parser = argparse.ArgumentParser(description="Transfer or resume a file over TCP with ProofDrop")
     add_arguments(parser)
     args = parser.parse_args()
     if not 1 <= args.chunk_size <= 2 * 1024 * 1024:
         parser.error("--chunk-size must be between 1 and 2097152")
-    result = upload(args.file, args.host, args.port, args.chunk_size, args.server_key, args.state)
+    if not 1 <= args.window_size <= 64:
+        parser.error("--window-size must be between 1 and 64")
+    if not 0 <= args.demo_rtt_ms <= 1000:
+        parser.error("--demo-rtt-ms must be between 0 and 1000")
+    result = upload(args.file, args.host, args.port, args.chunk_size, args.server_key, args.state, args.window_size, args.demo_rtt_ms)
     receipt = result["receipt"]
     print("\nSubmission accepted")
     print(f"  ID:      {receipt['upload_id']}")

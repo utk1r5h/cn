@@ -11,10 +11,11 @@ from .client import upload
 from .protocol import generate_server_keys
 from .receipts import verify_receipt
 from .server import serve
+from .storage import UploadStore
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="proofdrop", description="Resumable, encrypted file submission demo")
+    parser = argparse.ArgumentParser(prog="proofdrop", description="TCP chunked file transfer for a Computer Networks lab")
     commands = parser.add_subparsers(dest="command", required=True)
 
     keys = commands.add_parser("keygen", help="Create the server RSA private and public keys")
@@ -26,12 +27,15 @@ def main() -> None:
     server.add_argument("--data", default="server_data")
     server.add_argument("--private-key", default="keys/server_private.pem")
 
-    client = commands.add_parser("upload", help="Submit a file or resume an interrupted submission")
+    client = commands.add_parser("upload", help="Upload or resume over TCP and compare application ACK windows")
     add_upload_arguments(client)
 
     verify = commands.add_parser("verify", help="Verify a saved signed receipt")
     verify.add_argument("receipt", help="JSON receipt saved by the upload command")
     verify.add_argument("--server-key", default="keys/server_public.pem")
+
+    status = commands.add_parser("status", help="Display saved and in-progress uploads on the server")
+    status.add_argument("--data", default="server_data", help="Server data directory")
 
     args = parser.parse_args()
     if args.command == "keygen":
@@ -43,7 +47,14 @@ def main() -> None:
     elif args.command == "upload":
         if not 1 <= args.chunk_size <= 2 * 1024 * 1024:
             parser.error("--chunk-size must be between 1 and 2097152")
-        result = upload(args.file, args.host, args.port, args.chunk_size, args.server_key, args.state)
+        if not 1 <= args.window_size <= 64:
+            parser.error("--window-size must be between 1 and 64")
+        if not 0 <= args.demo_rtt_ms <= 1000:
+            parser.error("--demo-rtt-ms must be between 0 and 1000")
+        result = upload(
+            args.file, args.host, args.port, args.chunk_size, args.server_key,
+            args.state, args.window_size, args.demo_rtt_ms,
+        )
         receipt = result["receipt"]
         receipt_path = os.path.join(os.path.dirname(os.path.abspath(args.state)), "receipts", f"{receipt['upload_id']}.json")
         print("\nSubmission accepted")
@@ -54,6 +65,18 @@ def main() -> None:
         print(f"  Time:    {receipt['received_at']}")
         print("  Signed receipt verified with the pinned server public key.")
         print(f"  Saved:   {receipt_path}")
+    elif args.command == "status":
+        rows = UploadStore(args.data).status_rows()
+        if not rows:
+            print("No uploads found.")
+            return
+        print(f"Uploads in {args.data} (stored chunks are server acknowledgements):")
+        for row in rows:
+            print(
+                f"{row['status']:8} {row['upload_id']}  {row['filename']}  "
+                f"{row['stored_chunks']}/{row['total_chunks']} chunks  "
+                f"{row['stored_bytes']}/{row['size']} bytes  created {row['created_at']}"
+            )
     else:
         with open(args.receipt, encoding="utf-8") as receipt_file:
             saved = json.load(receipt_file)

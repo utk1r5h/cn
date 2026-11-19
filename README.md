@@ -1,181 +1,223 @@
-# ProofDrop
+# ProofDrop: Resumable File Transfer over TCP
 
-ProofDrop is a small client-server file-submission system for a Computer Networks lab. It demonstrates how a file can be sent over TCP in numbered chunks, resumed after a broken connection, checked for corruption, encrypted in transit, and accompanied by a verifiable signed receipt.
+ProofDrop is a small Computer Networks lab project. It demonstrates how an application can send a file over a TCP connection, divide the file into numbered chunks, acknowledge stored chunks, resume after a disconnect, and measure how acknowledgement delay affects transfer throughput.
 
-The project is intentionally a command-line prototype. Its code is split into small modules so each networking and security idea can be explained independently during a demo or viva.
+The main lab topics are **TCP sockets, byte-stream framing, application acknowledgements, stop-and-wait, a bounded sliding window, retransmission after reconnect, throughput, and client-server communication**. Cryptography is included to protect the submitted file and authenticate the server. The signed receipt is a normal server response; this project has no blockchain, blocks, consensus, mining, or distributed ledger.
 
-## What the project does
+## What you can demonstrate
 
-1. The client computes the file's SHA-256 hash and divides the file into chunks (256 KiB by default).
-2. The client and server perform an ephemeral X25519 Diffie-Hellman exchange. The server signs the exchange with its RSA identity key. The client checks that signature using a trusted copy of the server's public key.
-3. Both sides derive separate client-to-server and server-to-client keys. Each application message is encrypted and authenticated with AES-GCM.
-4. The client asks the server to start an upload. The server stores the upload metadata and replies with the indexes of chunks it has not stored yet.
-5. The client sends only missing chunks. The server checks each chunk's length and SHA-256 hash, writes it to disk, and records it in SQLite.
-6. When every chunk is present, the server joins the chunks in index order and compares the completed file's SHA-256 hash with the client's original hash.
-7. If the hashes match, the server saves the submission and returns a receipt containing the upload ID, filename, size, hash, timestamp, and accepted status. The server signs the receipt with RSA. The client verifies that signature and saves the receipt as JSON.
+1. Start a TCP server and submit a file from a client.
+2. Change the chunk size and observe the application-level chunk acknowledgements.
+3. Compare stop-and-wait (`--window-size 1`) with a bounded window (`--window-size 8`). An optional teaching delay makes the effect of waiting for acknowledgements easy to see on localhost.
+4. Interrupt an upload and resume it. The client asks the server for missing chunk indexes and skips chunks that the server already stored.
+5. Inspect the server's chunk counts with the `status` command.
+6. View the TCP connection, TCP sequence numbers, TCP acknowledgements, and traffic timing in Wireshark.
+7. Check that the server reassembles chunks in order, verifies SHA-256, and issues a signed receipt.
 
-To resume, run the same upload command again with the same local state database. The client reuses the upload ID, reconnects, and asks which chunks are missing. The server's SQLite database and chunk files survive server restarts.
+## How the transfer works
 
-## Requirements
+```text
+Client                                      Server
+  |---- TCP connect -------------------------->|
+  |<--- signed key exchange ------------------|
+  |---- start(file info, chunk count) -------->|
+  |<--- missing chunk indexes ----------------|
+  |---- chunk 0, chunk 1 ... (bounded window)->|
+  |<--- application ACKs for stored chunks ----|
+  |---- finalize ----------------------------->|
+  |<--- accepted receipt + signature ----------|
+```
 
-- Python 3.10 or newer
-- The `cryptography` Python package (listed in `requirements.txt`)
-- Two terminals for the local demonstration
+The application divides a file into chunks. Every chunk has an index, so the receiver can put it back in the right place. The server acknowledges a chunk after checking and storing it. The client can send one chunk and wait (`window-size 1`) or send a small group before waiting (`window-size 8`). This is a simple application-level stop-and-wait/sliding-window comparison.
+
+TCP itself is still responsible for reliable, ordered delivery of bytes within each connection. The application chunk acknowledgements serve a different purpose: they record which pieces have been durably stored so the upload can continue on a new connection after the old one ends. TCP packets/segments and ProofDrop file chunks are different things; TCP may split or combine application data however it chooses.
+
+## Computer Networks concepts in the code
+
+| CN concept | How ProofDrop demonstrates it |
+| --- | --- |
+| Client-server model | A TCP client connects to a threaded server listening on a host and port. |
+| TCP sockets | Python's `socket` and `socketserver` APIs carry the byte stream. |
+| TCP is a byte stream | A 4-byte length prefix frames each application message. `recv_exact` handles partial reads. |
+| Application protocol | `start`, `ready`, `chunk`, `chunk_ack`, `finalize`, and `receipt` messages define the exchange. |
+| Sequence/order | Each file chunk has an index; the server reassembles by index. |
+| Stop-and-wait | `--window-size 1` sends one chunk, then waits for its application ACK. |
+| Bounded window | A larger `--window-size` sends a group of chunks before reading their ACKs. This shows how pipelining can use a delayed path better. |
+| Acknowledgement and recovery | The server records acknowledged chunk indexes. After reconnect, the client sends only missing indexes. |
+| Throughput and delay | The client reports file-data throughput and mean application ACK time. An optional teaching wait makes the window comparison visible locally. |
+| Concurrent clients | The threaded server can handle separate client connections at the same time. |
+| Integrity | Per-chunk and whole-file SHA-256 checks catch inconsistent data or incorrect reassembly. |
+| Protocol security | X25519 key exchange, AES-GCM message protection, and a signed server receipt protect the session and provide server-origin evidence. |
+
+**Layering note:** the application window is a teaching example, not TCP's congestion window. TCP's own flow control, congestion control, segmentation, retransmission, and packet acknowledgements remain inside the operating system. The `--demo-rtt-ms` option adds a deliberate application wait once per chunk batch; it is not a real network emulator and should not be presented as a measured physical RTT.
 
 ## Setup
 
-From the project directory, create a virtual environment and install the one dependency:
+Requirements: Python 3.10 or newer and the `cryptography` package.
 
 ```sh
+cd /Users/utkarshshukla/Downloads/cn_lab_proj
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1` instead.
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 
-Generate the server's long-term identity keys:
+Generate the server keys once:
 
 ```sh
 python -m proofdrop keygen
 ```
 
-This creates `keys/server_private.pem` and `keys/server_public.pem`. The private key stays on the server. The public key is the client's trust anchor: copy it to each client machine through a trusted channel. For the local demo, both commands use the same `keys` directory.
+The private key remains on the server in `keys/server_private.pem`. The client uses `keys/server_public.pem` to authenticate the server. Do not run `keygen` again for an existing server unless you intend to replace its identity key.
 
-## Run locally
+## Viva demo A: stop-and-wait versus a window
 
-In terminal 1, start the server:
-
-```sh
-python -m proofdrop server --host 127.0.0.1 --port 5050
-```
-
-In terminal 2, make a sample file and upload it:
+Use two terminal windows. In terminal 1, start the server and leave it running:
 
 ```sh
-python -c "from pathlib import Path; Path('sample.bin').write_bytes(bytes(range(256)) * 5000)"
-python -m proofdrop upload sample.bin --host 127.0.0.1 --port 5050
+cd /Users/utkarshshukla/Downloads/cn_lab_proj
+source .venv/bin/activate
+python -m proofdrop server --host 127.0.0.1 --port 5051
 ```
 
-The client prints progress and the verified receipt. It saves a copy in `.proofdrop/receipts/<upload-id>.json`. The server stores the received file under `server_data/submissions/` and its metadata under `server_data/proofdrop_server.sqlite3`.
-
-Verify the saved receipt later:
+In terminal 2, create a repeatable 1.25 MiB sample file (1,310,720 bytes):
 
 ```sh
-python -m proofdrop verify .proofdrop/receipts/<upload-id>.json --server-key keys/server_public.pem
+cd /Users/utkarshshukla/Downloads/cn_lab_proj
+source .venv/bin/activate
+python -c "from pathlib import Path; Path('sample.bin').write_bytes(bytes(range(256)) * 5120)"
 ```
 
-For a test over a LAN, set the server's `--host` to its LAN interface (or `0.0.0.0`) and use that machine's reachable IP in the client command. Make sure the selected TCP port is reachable through the lab network firewall. Use a trusted copy of the public key on the client. The default bind is localhost-only.
+Run stop-and-wait with a small chunk and a 20 ms teaching wait per ACK batch:
 
-## Demonstrate resume behavior
+```sh
+python -m proofdrop upload sample.bin --port 5051 --chunk-size 4096 --window-size 1 --demo-rtt-ms 20 --state .proofdrop/stop_wait.sqlite3
+```
 
-1. Start the server and begin uploading a moderately large file.
-2. Stop the client with Ctrl+C or disconnect the network while it is sending chunks.
-3. Restart the server if desired; its received chunks remain in `server_data/chunks/` and SQLite.
-4. Run the exact same upload command again, using the same file and `--state` path.
-5. The client prints the count of chunks still to send. Chunks already acknowledged by the server are skipped.
+Then run the same file with a window of eight. A separate state file gives this run a fresh upload ID, so the chunks are transferred again:
 
-For a more controlled interruption, use a larger file or a smaller `--chunk-size`, such as `--chunk-size 32768`. If a brief socket error occurs, the client also retries up to three connections automatically. Restarting the command is the reliable way to demonstrate persistence after a deliberate interruption.
+```sh
+python -m proofdrop upload sample.bin --port 5051 --chunk-size 4096 --window-size 8 --demo-rtt-ms 20 --state .proofdrop/window8.sqlite3
+```
 
-## Commands and options
+Compare elapsed time, application ACK timing, and file-data throughput in the two summaries. With 320 chunks, the configured teaching wait alone is about 6.4 seconds for window 1 and about 0.8 seconds for window 8. Actual values include local processing and scheduling, so treat them as a demonstration, not a benchmark. Explain that a larger window lets more application data be in flight before the sender waits; TCP still manages the underlying network connection.
 
-- `python -m proofdrop keygen [--dir keys]` creates an RSA-3072 private/public key pair.
-- `python -m proofdrop server [--host 127.0.0.1] [--port 5050] [--data server_data] [--private-key keys/server_private.pem]` starts the threaded TCP server.
-- `python -m proofdrop upload FILE [--host HOST] [--port PORT] [--chunk-size BYTES] [--server-key PATH] [--state PATH]` uploads or resumes a file. Chunk sizes from 1 byte through 2 MiB are accepted.
-- `python -m proofdrop verify RECEIPT.json [--server-key PATH]` verifies a saved receipt signature.
+## Viva demo B: resume a partial upload
 
-The upload ID is kept in the client's local SQLite state, keyed by server address, source file path, and file hash. Changing the file contents creates a new upload ID. The client recalculates the full hash on each run so it can detect local file changes.
+Create a larger sample file:
 
-## Project files
+```sh
+python -c "from pathlib import Path; Path('resume_demo.bin').write_bytes(bytes(range(256)) * 16384)"
+```
 
-### `proofdrop/__init__.py`
+Begin an upload with a small chunk and a short teaching wait:
 
-Marks `proofdrop` as a Python package and defines its version. It contains no networking behavior.
+```sh
+python -m proofdrop upload resume_demo.bin --port 5051 --chunk-size 8192 --window-size 1 --demo-rtt-ms 10 --state .proofdrop/resume.sqlite3
+```
 
-### `proofdrop/__main__.py`
+After several `ACK for chunk` lines, press **Ctrl+C**. Run the exact same command again. The second run should report chunks already stored and send only what remains. You can also stop and restart the server between attempts; its SQLite database and chunk files preserve progress.
 
-Implements the top-level `python -m proofdrop` command. It parses the four subcommands (`keygen`, `server`, `upload`, and `verify`) and passes the options to the relevant module. Keeping a single entry point gives the demo consistent command names.
+Inspect server state at any time from another terminal on the server machine:
 
-### `proofdrop/protocol.py`
+```sh
+python -m proofdrop status --data server_data
+```
 
-Contains the wire-level building blocks. TCP is a byte stream, so `send_frame`, `recv_frame`, and `recv_exact` add and read a four-byte network-order message length; they do not assume one `recv()` call equals one message. The handshake creates fresh X25519 keys per connection and signs the two ephemeral public keys with the server's RSA key. After the client verifies the signature against its pinned RSA public key, both sides derive 64 bytes with HKDF-SHA-256. The first half encrypts client-to-server messages and the second half encrypts server-to-client messages. `SecureChannel` encrypts JSON messages with AES-GCM and uses a distinct increasing nonce counter for each direction.
+`status` displays each upload's state, ID, filename, stored/total chunks, and stored/total bytes. It reads the server's local data directory, so run it on the server machine (or where that directory is available).
 
-This file also loads and creates PEM-encoded RSA keys. The private key is written with owner-only permissions where the operating system supports them.
+## Other commands
 
-### `proofdrop/client.py`
+```text
+python -m proofdrop keygen [--dir keys]
+python -m proofdrop server [--host 127.0.0.1] [--port 5050] [--data server_data]
+python -m proofdrop upload FILE [--host HOST] [--port PORT] [--chunk-size BYTES]
+    [--window-size 1..64] [--demo-rtt-ms 0..1000] [--state PATH]
+python -m proofdrop status [--data server_data]
+python -m proofdrop verify RECEIPT.json [--server-key keys/server_public.pem]
+```
 
-Implements file hashing, persistent client upload IDs, and the upload loop. It opens a TCP connection, authenticates the server, asks for the missing chunk indexes, seeks to each missing chunk in the local file, and waits for an acknowledgement before advancing. On common network errors it reconnects up to three times; every new connection requests the missing list again. After finalization it verifies the receipt and stores both its signed fields and signature as JSON.
-
-The local state database is only a resume convenience. The server database is the authoritative record of which chunks it has accepted.
-
-### `proofdrop/server.py`
-
-Runs a `ThreadingTCPServer`, allowing multiple client connections to be handled by separate threads. Each connection performs the handshake, receives upload metadata, returns the missing indexes, accepts chunk messages, and finalizes the file. Errors after the handshake are returned inside the encrypted channel. The server's default network binding is `127.0.0.1` so it is local-only unless explicitly configured otherwise.
-
-### `proofdrop/storage.py`
-
-Owns persistent server state. SQLite stores one upload row and one row per accepted chunk. The binary chunk contents are stored separately in `server_data/chunks/<upload-id>/`. Chunk writes use a temporary file followed by an atomic rename, then record the verified chunk in SQLite. When a client resumes, the server rechecks that recorded chunk files still exist and match their stored hashes; missing or damaged chunks are requested again. Finalization reads chunks by index, computes the full-file SHA-256 while assembling them, and only moves the completed file into `server_data/submissions/` if both size and hash match. A lock serializes storage operations in this single-process prototype.
-
-### `proofdrop/receipts.py`
-
-Defines deterministic JSON serialization for the receipt fields, signs them with RSA-PSS/SHA-256 on the server side, and verifies a saved receipt with the public key. Deterministic serialization matters: the verifier must hash exactly the same bytes that the signer hashed.
-
-### `requirements.txt`
-
-Lists the single external library. Python's built-in modules provide TCP sockets, SQLite, JSON, file operations, and SHA-256; `cryptography` supplies maintained X25519, HKDF, AES-GCM, RSA-PSS, and PEM key handling.
-
-### `.gitignore`
-
-Keeps virtual environments, Python bytecode, runtime databases, server submissions, local resume state, and generated private keys out of version control. The private key should never be committed or sent to clients.
-
-## Protocol summary
-
-Each TCP message is encoded as a 4-byte big-endian length followed by that many bytes. The two handshake messages are JSON in this framing; after the key exchange, all messages use the same framing but their contents are AES-GCM ciphertext. Encrypted JSON messages have these application actions:
-
-| Direction | Message | Purpose |
-| --- | --- | --- |
-| Client to server | `start` | Provide upload ID, filename, size, chunk size, total chunks, and full SHA-256 |
-| Server to client | `ready` | Return indexes missing from persistent server storage |
-| Client to server | `chunk` | Send one indexed chunk, its SHA-256, and base64-encoded bytes |
-| Server to client | `chunk_ack` | Confirm that chunk bytes were checked and stored |
-| Client to server | `finalize` | Ask the server to assemble and verify the file |
-| Server to client | `receipt` | Return accepted receipt fields and RSA signature |
-
-## Cryptography and integrity in plain language
-
-- **X25519 Diffie-Hellman:** each connection creates temporary public/private key pairs. The shared secret is never sent over the network.
-- **RSA signature on the handshake:** the server proves that it owns the private key corresponding to the public key the client trusts. Signing both ephemeral keys prevents an attacker from silently replacing the exchange.
-- **HKDF-SHA-256:** turns the shared secret into independent keys for each direction of communication.
-- **AES-GCM:** encrypts each application message and detects if ciphertext or authenticated data was changed.
-- **Chunk SHA-256:** checks each chunk before the server records it.
-- **Whole-file SHA-256:** confirms the reconstructed file is byte-for-byte consistent with the file hash sent at the start.
-- **Signed receipt:** provides evidence that the holder of the server's private key issued those receipt fields. Anyone with the trusted public key can check that signature.
-
-## Viva talking points
-
-**Why use TCP?** TCP provides an ordered reliable byte stream while a connection exists. The application still needs its own framing because TCP does not preserve message boundaries. The upload protocol adds chunk indexes and acknowledgements so the application can resume across separate TCP connections.
-
-**How does resumption work?** Every chunk has a stable index. After reconnecting, the client asks for the server's missing indexes and transmits only those. The server's database records acknowledgements durably, so a server restart does not erase progress.
-
-**Why hash chunks and then hash the whole file?** A chunk hash detects a damaged or mismatched chunk when it arrives. The whole-file hash checks that all accepted chunks, in the right order, reconstruct the original file.
-
-**What is the role of AES-GCM?** It gives confidentiality and message integrity for application messages. Its authentication tag causes modified ciphertext to fail decryption.
-
-**Why sign the handshake and receipt?** The signature authenticates the server's ephemeral key exchange and lets a recipient verify that the receipt fields came from the server key holder. Encryption alone would not establish the server's identity.
-
-**Does the receipt prove which student uploaded the file?** No. This prototype authenticates the server and protects the session, but it does not log in or cryptographically authenticate individual students. A real deployment would need user accounts or client certificates and access control. The receipt proves server acceptance of a file hash and metadata, not a real-world person's identity.
-
-**Can this replace HTTPS or a production submission service?** No. It is a lab prototype for explaining sockets and protocol components. It has no account system, rate limiting, quotas, formal protocol audit, key rotation, or production-grade operational controls. The server private key is unencrypted on disk, and the server must be configured to bind to a network interface for LAN use.
+The default chunk size is 256 KiB. The maximum is 2 MiB. The default application window is 1, which is easiest to explain as stop-and-wait. `--demo-rtt-ms` defaults to zero.
 
 ## Wireshark demonstration
 
-Capture traffic on the loopback or lab interface while uploading. You can identify the TCP connection and observe message lengths and timing. After the key exchange, application payloads are encrypted ciphertext, so filenames and file contents should not appear as readable protocol data. The unencrypted handshake includes ephemeral public keys and a signature; it does not contain the file content or the shared secret. Use loopback capture support or a LAN interface appropriate to your operating system.
+Capture on loopback while uploading and use the display filter:
 
-## Notes and limitations
+```text
+tcp.port == 5051
+```
 
-- This is an educational prototype, not a production secure file-transfer protocol.
-- The public key must be delivered to clients through a trusted channel. Accepting an arbitrary key from the network would defeat server authentication.
-- Client identity is not authenticated. The lab can extend the protocol with student login or client certificates as a future improvement.
-- The server trusts the configured storage directory and does not implement quotas or automatic cleanup of incomplete uploads.
-- Files are buffered as base64 inside each encrypted JSON message, so the 2 MiB maximum chunk size favors code clarity over throughput.
-- A changed source file receives a new upload ID because its SHA-256 hash changes. Old partial server uploads are retained for inspection and can be manually removed from the data directory when the server is stopped.
+Point out the TCP connection, TCP sequence and acknowledgement numbers, segment timing, and changing payload lengths. TCP sequence/ACK numbers are transport-layer behavior. ProofDrop's chunk indexes and `chunk_ack` messages are application-layer behavior. The application payload after key exchange is encrypted, so the file name and chunk JSON are not readable in a packet capture. TCP segmentation does not line up one-to-one with ProofDrop chunks.
+
+For a LAN demo, bind the server to a reachable interface (for example `--host 0.0.0.0`) and connect to that computer's IP address from the client. Keep the server's public key trusted on the client.
+
+## File-by-file guide
+
+### `proofdrop/__init__.py`
+
+Marks the directory as a Python package and defines its version.
+
+### `proofdrop/__main__.py`
+
+Defines the `python -m proofdrop` command. It parses `keygen`, `server`, `upload`, `status`, and `verify`, then dispatches to the relevant module. Argument checks keep the chunk size, window, and teaching delay inside documented limits.
+
+### `proofdrop/client.py`
+
+Hashes the source file, creates or finds its persistent upload ID, opens the TCP connection, authenticates the server, and performs the upload. The chunk loop sends at most `window_size` chunks before it waits for application ACKs. Each ACK is matched to its chunk index. On a network interruption, a new connection asks the server for missing indexes and resumes. The client reports ACK timing and file-data throughput, verifies the server's signed receipt, and saves it under `.proofdrop/receipts/`.
+
+The teaching delay is applied once after each batch is sent and before the client reads its ACKs. It exists to make the effect of waiting visible on a fast local machine; it does not delay real network packets.
+
+### `proofdrop/protocol.py`
+
+Implements TCP message framing and the encrypted channel. `recv_exact` handles TCP splitting a message across reads. Four-byte big-endian length prefixes let the receiver determine where each application message ends. The handshake uses ephemeral X25519 keys, a server RSA signature, and HKDF to derive separate keys for each direction. AES-GCM protects each later message.
+
+### `proofdrop/server.py`
+
+Creates a threaded TCP server. For each client it performs the key exchange, reads upload metadata, returns missing chunk indexes, receives chunk messages, sends application ACKs, and finalizes the upload. Separate client connections can be served by separate threads.
+
+### `proofdrop/storage.py`
+
+Stores upload metadata and acknowledged chunk records in SQLite. Chunk bytes live under `server_data/chunks/`; accepted completed files live under `server_data/submissions/`. It checks each chunk, rechecks saved chunks on resume, and reassembles them by index before comparing the full-file hash. `status_rows` supplies the `status` command with stored chunk and byte totals.
+
+### `proofdrop/receipts.py`
+
+Serializes receipt fields consistently, signs them with RSA-PSS/SHA-256, and verifies the signature using the server's public key. This is a signed server receipt, not a blockchain transaction or ledger entry.
+
+### `requirements.txt`
+
+Lists the only third-party dependency, `cryptography`. TCP, SQLite, JSON, file operations, threading, and SHA-256 use Python's standard library.
+
+### `.gitignore`
+
+Excludes the virtual environment, Python bytecode, local state, server data, and generated keys. The server private key should not be committed or distributed to clients.
+
+## Viva questions and short answers
+
+**Why use TCP?** It provides a reliable, ordered byte stream between the client and server. The application still adds framing because TCP does not preserve message boundaries.
+
+**Why split a file into chunks if TCP is reliable?** TCP handles delivery during one connection. Chunks let the application save progress durably and resume the file across a new connection after a disconnect.
+
+**Are ProofDrop chunks TCP packets?** No. They are application-level pieces. TCP can divide one chunk among several segments or carry data from multiple chunks in its stream.
+
+**What does the window comparison show?** Window 1 waits for each application ACK before sending the next chunk. A larger bounded window sends several chunks before waiting. This makes an artificial ACK delay cost fewer wait rounds. It is not a replacement for TCP congestion control.
+
+**What is measured as throughput?** File bytes sent by the client divided by elapsed transfer time. It is application payload throughput, not raw link bandwidth; it includes connection and server processing time.
+
+**Is the displayed ACK time a pure RTT?** No. It is the time from sending an application chunk to receiving its application ACK, including network delay and server processing. When the demo wait is enabled, it includes that wait too.
+
+**Why are both chunk and whole-file hashes checked?** A chunk hash checks each piece at receipt. The whole-file hash checks that ordered reassembly matches the original file.
+
+**What does the receipt prove?** It shows that the server key holder signed the listed upload ID, hash, size, filename, and acceptance time. It does not identify a student; client login is outside this prototype.
+
+**Where is the blockchain?** There is none. SQLite stores ordinary upload and chunk rows. A hash and signed receipt support integrity and server acknowledgement, but there are no blocks, chain links, consensus, or distributed ledger.
+
+## Scope and limitations
+
+- This is an educational prototype, not a production file-transfer service.
+- The application window is intentionally simple and does not implement TCP congestion control; the operating system's TCP stack does that.
+- The demo RTT wait is a repeatable teaching knob, not a packet-level network simulator or substitute for a real LAN/WAN measurement.
+- The server authenticates itself to the client. The project does not authenticate individual student accounts.
+- The server has no quotas, rate limits, or automatic cleanup for abandoned partial uploads.
+- Chunks are base64 encoded inside JSON for readability, so this favors simple explanation over maximum speed.
