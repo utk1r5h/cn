@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2c">
+  <title>ProofDrop Network Lab</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="ProofDrop home"><span class="brand-mark">PD</span><span>PROOFDROP <small>NETWORK LAB</small></span></a>
+    <div class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">Checking TCP target...</span></div>
+  </header>
+
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">COMPUTER NETWORKS LAB / LIVE TRANSFER VIEW</div>
+      <h1>See the conversation<br><em>behind a file transfer.</em></h1>
+      <p>Upload through the browser, then follow ProofDrop's framed messages, chunk indexes, and application acknowledgements over TCP.</p>
+      <div class="layer-note"><strong>Layer note</strong><span>This trace shows ProofDrop application frames carried over TCP. It does not capture individual IP/TCP packets. Use Wireshark for TCP headers and sequence numbers.</span></div>
+    </section>
+
+    <section class="workspace">
+      <aside class="control-column">
+        <div class="panel upload-panel">
+          <div class="panel-kicker">01 / SEND</div>
+          <h2>New transfer</h2>
+          <form id="uploadForm">
+            <label class="dropzone" id="dropzone">
+              <input id="fileInput" type="file" required>
+              <span class="upload-icon">+</span>
+              <strong id="fileName">Choose a file to send</strong>
+              <small id="fileSize">or drop it here</small>
+            </label>
+
+            <div class="form-grid">
+              <label>Chunk size
+                <select id="chunkSize">
+                  <option value="8192">8 KiB - more ACKs</option>
+                  <option value="65536" selected>64 KiB - balanced</option>
+                  <option value="262144">256 KiB - fewer chunks</option>
+                </select>
+              </label>
+              <label>App window
+                <select id="windowSize">
+                  <option value="1" selected>1 - stop-and-wait</option>
+                  <option value="4">4 chunks</option>
+                  <option value="8">8 chunks</option>
+                </select>
+              </label>
+              <label class="wide">Teaching ACK wait
+                <select id="demoRtt">
+                  <option value="0">Off - real local timing</option>
+                  <option value="10">10 ms per batch</option>
+                  <option value="20" selected>20 ms per batch</option>
+                </select>
+              </label>
+            </div>
+            <button id="sendButton" class="primary-button" type="submit">Start TCP upload <span aria-hidden="true">-&gt;</span></button>
+            <button id="pauseButton" class="secondary-button" type="button" hidden>Interrupt transfer</button>
+            <p id="formMessage" class="form-message" role="status">The terminal CLI remains available with <code>python -m proofdrop upload</code>.</p>
+          </form>
+        </div>
+
+        <div class="panel detail-panel">
+          <div class="panel-kicker">FRAME INSPECTOR</div>
+          <h2 id="detailTitle">Select a trace row</h2>
+          <p id="detailIntro" class="muted">Inspect direction, chunk sequence, application size, and framed bytes. Payload content stays encrypted.</p>
+          <div class="detail-list">
+            <div><span>Layer</span><strong id="detailLayer">-</strong></div>
+            <div><span>Direction</span><strong id="detailDirection">-</strong></div>
+            <div><span>Chunk sequence</span><strong id="detailSequence">-</strong></div>
+            <div><span>SHA-256 prefix</span><strong id="detailHash">-</strong></div>
+            <div><span>File chunk bytes</span><strong id="detailChunkBytes">-</strong></div>
+            <div><span>Application JSON bytes</span><strong id="detailAppBytes">-</strong></div>
+            <div><span>Length-prefixed frame bytes</span><strong id="detailFrameBytes">-</strong></div>
+            <div><span>Frame overhead</span><strong id="detailOverhead">-</strong></div>
+            <div><span>Encrypted</span><strong id="detailEncrypted">-</strong></div>
+          </div>
+        </div>
+      </aside>
+
+      <section class="monitor-column">
+        <div class="metric-grid">
+          <article class="metric-card"><span>TRANSFER</span><strong id="statusValue">Idle</strong><small id="fileValue">No file selected</small></article>
+          <article class="metric-card"><span>CHUNK ACKS</span><strong id="ackValue">0 / 0</strong><small id="ackHint">Application progress</small></article>
+          <article class="metric-card"><span>MEAN ACK TIME</span><strong id="rttValue">-</strong><small>Send-to-application-ACK</small></article>
+          <article class="metric-card"><span>FILE THROUGHPUT</span><strong id="throughputValue">-</strong><small>Payload bytes / transfer time</small></article>
+        </div>
+
+        <div class="panel progress-panel">
+          <div class="progress-heading"><div><div class="panel-kicker">TRANSFER PROGRESS</div><h2 id="progressLabel">Waiting for a file</h2></div><strong id="percentValue">0%</strong></div>
+          <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+          <div class="progress-foot"><span id="progressChunks">0 chunks acknowledged</span><span id="uploadId">Upload ID appears here</span></div>
+        </div>
+
+        <div class="panel trace-panel">
+          <div class="trace-header">
+            <div><div class="panel-kicker">02 / OBSERVE</div><h2>Application frame trace</h2></div>
+            <div class="live-badge"><span class="live-dot"></span><span id="traceState">Ready</span></div>
+          </div>
+          <div class="trace-scroll">
+            <table>
+              <thead><tr><th>#</th><th>Time</th><th>Layer</th><th>Direction</th><th>Message</th><th>Chunk #</th><th>Payload</th><th>Frame</th><th>Security</th></tr></thead>
+              <tbody id="traceRows"><tr class="empty-row"><td colspan="9">Start an upload to inspect the protocol exchange.</td></tr></tbody>
+            </table>
+          </div>
+          <div class="trace-foot"><span><i class="legend-dot app-dot"></i>ProofDrop application frame</span><span><i class="legend-dot web-dot"></i>Browser-to-dashboard HTTP</span><span>Frame size includes the 4-byte prefix and encryption tag; excludes TCP/IP headers.</span></div>
+        </div>
+      </section>
+    </section>
+
+    <footer><span>ProofDrop / Client-server file transfer over TCP</span><span>Packet headers: inspect with Wireshark <code>tcp.port == 5051</code></span></footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

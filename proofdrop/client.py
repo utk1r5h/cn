@@ -12,8 +12,9 @@ import socket
 import time
 import uuid
 from contextlib import closing
+from typing import Callable
 
-from .protocol import client_handshake, load_public_key
+from .protocol import EventCallback, client_handshake, load_public_key
 
 DEFAULT_CHUNK_SIZE = 256 * 1024
 
@@ -50,12 +51,16 @@ def upload(
     state_path: str,
     window_size: int = 1,
     demo_rtt_ms: int = 0,
+    event_callback: EventCallback | None = None,
+    pause_requested: Callable[[], bool] | None = None,
+    before_finalize: Callable[[], bool] | None = None,
 ) -> dict:
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Not a regular file: {path}")
     size = os.path.getsize(path)
     digest = sha256_file(path)
+    
     total_chunks = (size + chunk_size - 1) // chunk_size
     remote = f"{host}:{port}"
     upload_id = state_upload_id(state_path, remote, path, digest)
@@ -81,7 +86,7 @@ def upload(
         try:
             with socket.create_connection((host, port), timeout=15) as sock:
                 sock.settimeout(60)
-                channel = client_handshake(sock, public_key)
+                channel = client_handshake(sock, public_key, event_callback)
                 channel.send(metadata)
                 ready = channel.receive()
                 if ready.get("type") == "error":
@@ -94,8 +99,18 @@ def upload(
                     f"Upload {upload_id}: {size} bytes, {total_chunks} chunks; "
                     f"{len(missing)} to send (application window {window_size})"
                 )
+
+                def pause_result() -> dict:
+                    print("Upload paused after the last acknowledged chunk batch.")
+                    return {"paused": True, "receipt": None, "signature": None, "summary": None}
+
+                if pause_requested is not None and pause_requested():
+                    return pause_result()
+
                 with open(path, "rb") as stream:
                     for batch_start in range(0, len(missing), window_size):
+                        if pause_requested is not None and pause_requested():
+                            return pause_result()
                         batch = missing[batch_start:batch_start + window_size]
                         outstanding = {}
                         for index in batch:
@@ -129,6 +144,12 @@ def upload(
                             acknowledged_bytes += data_size
                             acknowledged_chunks += 1
                             print(f"  ACK for chunk {index + 1}/{total_chunks}")
+
+                        if pause_requested is not None and pause_requested():
+                            return pause_result()
+
+                if before_finalize is not None and not before_finalize():
+                    return pause_result()
                 channel.send({"action": "finalize", "upload_id": upload_id})
                 response = channel.receive()
                 if response.get("type") == "error":
@@ -145,6 +166,18 @@ def upload(
                 elapsed = max(time.monotonic() - transfer_started, 0.000001)
                 throughput = wire_bytes_sent / elapsed
                 average_ack = sum(ack_times) / len(ack_times) if ack_times else None
+                summary = {
+                    "elapsed_seconds": elapsed,
+                    "file_bytes_sent": wire_bytes_sent,
+                    "acknowledged_bytes": acknowledged_bytes,
+                    "acknowledged_chunks": acknowledged_chunks,
+                    "already_stored_chunks": already_stored_chunks,
+                    "total_chunks": total_chunks,
+                    "throughput_mib_s": throughput / (1024 * 1024),
+                    "mean_ack_ms": average_ack * 1000 if average_ack is not None else None,
+                    "window_size": window_size,
+                    "demo_rtt_ms": demo_rtt_ms,
+                }
                 print("\nTransfer summary")
                 print(f"  Chunks acknowledged this run: {acknowledged_chunks}")
                 print(f"  Chunks already stored:        {already_stored_chunks}")
@@ -159,7 +192,7 @@ def upload(
                     print(f"  Mean chunk ACK time:          {average_ack * 1000:.2f} ms (network + server processing + teaching wait)")
                 else:
                     print("  Mean chunk ACK time:          n/a (all chunks were already stored)")
-                return {"receipt": response["receipt"], "signature": response["signature"]}
+                return {"receipt": response["receipt"], "signature": response["signature"], "summary": summary}
         except (ConnectionError, TimeoutError, socket.timeout, OSError):
             if attempt == 3:
                 raise

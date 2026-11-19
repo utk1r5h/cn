@@ -12,6 +12,7 @@ from .protocol import generate_server_keys
 from .receipts import verify_receipt
 from .server import serve
 from .storage import UploadStore
+from .web import serve_dashboard
 
 
 def main() -> None:
@@ -36,6 +37,15 @@ def main() -> None:
 
     status = commands.add_parser("status", help="Display saved and in-progress uploads on the server")
     status.add_argument("--data", default="server_data", help="Server data directory")
+
+    web = commands.add_parser("web", help="Start the browser upload and TCP frame dashboard")
+    web.add_argument("--web-host", default="127.0.0.1")
+    web.add_argument("--web-port", type=int, default=8080)
+    web.add_argument("--tcp-host", default="127.0.0.1", help="Host where the ProofDrop TCP server is listening")
+    web.add_argument("--tcp-port", type=int, default=5050)
+    web.add_argument("--server-key", default="keys/server_public.pem")
+    web.add_argument("--state", default=".proofdrop/web_client_state.sqlite3")
+    web.add_argument("--inbox", default=".proofdrop/web_inbox")
 
     args = parser.parse_args()
     if args.command == "keygen":
@@ -77,6 +87,16 @@ def main() -> None:
                 f"{row['stored_chunks']}/{row['total_chunks']} chunks  "
                 f"{row['stored_bytes']}/{row['size']} bytes  created {row['created_at']}"
             )
+    elif args.command == "web":
+        serve_dashboard(
+            web_host=args.web_host,
+            web_port=args.web_port,
+            tcp_host=args.tcp_host,
+            tcp_port=args.tcp_port,
+            server_key=args.server_key,
+            state_path=args.state,
+            inbox=args.inbox,
+        )
     else:
         with open(args.receipt, encoding="utf-8") as receipt_file:
             saved = json.load(receipt_file)
